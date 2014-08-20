@@ -10,31 +10,34 @@
 */
 
 
-#include <dlib/matrix.h>
-#include <dlib/optimization.h>
-#include <dlib/numeric_constants.h>
-#include <dlib/numerical_integration.h>
+//#include <dlib/matrix.h>
+//#include <dlib/optimization.h>
+//#include <dlib/numeric_constants.h>
+//#include <dlib/numerical_integration.h>
 #include <iostream>
-#include <vector>
+#include <fstream>
+#include <iomanip>
+//#include <vector>
 #include <gsl/gsl_randist.h>
 #include <gsl/gsl_cdf.h>
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_fft_real.h>
+#include <gsl/gsl_fft_halfcomplex.h>
+    
 #include <python2.7/Python.h>
     
-
-
-
-
-
 using namespace std;
-using namespace dlib;
+//using namespace dlib;
+
+
+#define REAL(z,i) ((z)[2*(i)])
+#define IMAG(z,i) ((z)[2*(i)+1])
 
 // ----------------------------------------------------------------------------------------
 
-typedef matrix<double,2,1> input_vector;
-typedef matrix<double,3,1> parameter_vector;
+//typedef matrix<double,2,1> input_vector;
+//typedef matrix<double,3,1> parameter_vector;
 
 // ----------------------------------------------------------------------------------------
 
@@ -52,6 +55,33 @@ double itegral_student(double x, double mu, double sig,  double skew, double  nu
     return 2.*gsl_ran_tdist_pdf((x-mu)/sig, nu)* \
     gsl_cdf_tdist_P(skew*((x-mu)/sig)*sqrt((nu+1.)/(nu+(x-mu)*(x-mu)/sig/sig)),(nu+1.))/sig;
 }
+
+int search_min(const gsl_vector *v, double val){
+    for (int i=0; i < v->size; i++)
+        if (val < gsl_vector_get(v, i)) 
+            return i; 
+}
+
+int search_max(const gsl_vector *v, double val){
+    for (int i=0; i < v->size; i++)
+        if (val < gsl_vector_get(v, i)){ 
+            return i; 
+        }
+}
+
+void complex_vector_abs(gsl_vector *out, const gsl_vector *re, const gsl_vector *im )
+{
+    for (int i=0; i < out->size; i++ )
+        gsl_vector_set(out, i, sqrt( gsl_vector_get(re,i)*gsl_vector_get(re,i) + gsl_vector_get(im,i)*gsl_vector_get(im,i) ) );
+}
+
+gsl_vector * c_imag(gsl_vector_complex &v){
+    gsl_vector_view im = gsl_vector_complex_real(v);
+    gsl_vector_view im_2 = gsl_vector_subvector_with_stride(&im.vector,1, 2,  v->size/2);
+    return   &im_2.vector;     
+}
+
+
 
 //Destroy original vector arr
 void hanning(gsl_vector *arr, gsl_vector *x, double xmin, double xmax, double dw){
@@ -96,7 +126,7 @@ void plot_matplotlib(gsl_matrix *m){
    
    size_t rows=m->size1;
    size_t cols=m->size2;
-
+   //cout << cols << "\t" << rows << endl;
    for (int i=0; i<rows; i++)
     {
         for (int j = 0; j < cols; j++){
@@ -106,7 +136,7 @@ void plot_matplotlib(gsl_matrix *m){
    }
 
    PyRun_SimpleString("data=np.loadtxt('tmp.plt')");
-   for (int j = 0; j < cols; j++){
+   for (int j = 1; j < cols; j++){
        sprintf(buf, "pylab.plot(data[:,0], data[:,%i], label='%i')", j, j);
        PyRun_SimpleString(buf);
    }
@@ -116,7 +146,8 @@ void plot_matplotlib(gsl_matrix *m){
    in.close();
 }
 
-double model (
+
+/*double model (
     const input_vector& input,
     const parameter_vector& params
 )
@@ -131,13 +162,14 @@ double model (
     const double temp = p0*i0 + p1*i1 + p2;
 
     return temp*temp;
-}
+}*/
 
 // ----------------------------------------------------------------------------------------
 
 // This function is the "residual" for a least squares problem.   It takes an input/output
 // pair and compares it to the output of our model and returns the amount of error.  The idea
 // is to find the set of parameters which makes the residual small on all the data pairs.
+/*
 double residual (
     const std::pair<input_vector, double>& data,
     const parameter_vector& params
@@ -173,7 +205,7 @@ parameter_vector residual_derivative (
 }
 
 // ----------------------------------------------------------------------------------------
-
+*/
 int main()
 {
     const int max_mu_size=601;
@@ -182,191 +214,119 @@ int main()
     in= fopen("../mean.chi_9nm", "r");
     gsl_matrix *e = gsl_matrix_alloc(max_mu_size, 4);
     gsl_vector * kvar=gsl_vector_alloc(max_mu_size);
-    gsl_vector * mu_0pad=gsl_vector_alloc(zero_pad_size);
-    gsl_vector * r_0pad=gsl_vector_alloc(zero_pad_size);
     gsl_vector * muvar=gsl_vector_alloc(max_mu_size);
+    gsl_vector * mu_0pad=gsl_vector_alloc(zero_pad_size);
+    gsl_vector * r_0pad=gsl_vector_alloc(zero_pad_size/2); //half of lenght 
+    gsl_vector * kvar_0pad=gsl_vector_alloc(zero_pad_size);
+
     gsl_matrix_fscanf(in, e);
     fclose(in);
     gsl_matrix_get_col(kvar,e,0);
     gsl_matrix_get_col(muvar,e,1);
     gsl_vector_set_zero(mu_0pad);
 
+
     double dk=gsl_vector_get (kvar, 1)-gsl_vector_get (kvar, 0);
     double dr=M_PI/float(zero_pad_size-1)/dk;
 
     for (int i = 0; i < zero_pad_size; i++)
     {
+      gsl_vector_set (kvar_0pad, i, dk*i);
+    }
+    for (int i = 0; i < zero_pad_size/2; i++)
+    {
       gsl_vector_set (r_0pad, i, dr*i);
     }
-
     for (int i = 0; i < max_mu_size; i++)
     {
       gsl_vector_set (mu_0pad, i, gsl_vector_get (muvar, i));
     }
 
-    cout << gsl_vector_get (muvar, 1) <<"\t" << gsl_vector_get (muvar, 2) << endl;
+
+    //cout << gsl_vector_get (muvar, 1) <<"\t" << gsl_vector_get (muvar, 2) << endl;
+    //plot_matplotlib(e);
+
+    gsl_vector *mu_widowed=gsl_vector_alloc(zero_pad_size);
+    gsl_vector_memcpy (mu_widowed, mu_0pad);
+    double kmin=3.5, kmax=18.0, dwk=0.8;
+    hanning(mu_widowed, kvar_0pad, kmin, kmax, dwk);
+
+
+    //FFT transform
+    double *data = new double [zero_pad_size] ;
+    memcpy(data, mu_widowed->data, zero_pad_size*sizeof(double));
+    gsl_fft_real_radix2_transform(data, 1, zero_pad_size);
+
+    gsl_vector_complex *fourier_data = gsl_vector_complex_alloc (zero_pad_size);
+    gsl_fft_halfcomplex_radix2_unpack(data, fourier_data->data, 1, zero_pad_size);
+   
+    cout << data[0] << "\t" << data[1] << "\t" << data[2] << "\t" << endl;
+    cout << fourier_data->data[0] << "\t" << fourier_data->data[1] << "\t" << fourier_data->data[2] << "\t" << endl;
+
+
+    //gsl_complex_packed_array fftR = fourier_data->data;
+ 
+    gsl_vector_view fftR_real = gsl_vector_complex_real(fourier_data);
+    gsl_vector *fftR_imag = c_imag(*fourier_data);
+    gsl_vector *fftR_abs=gsl_vector_alloc(fourier_data->size / 2);
+    complex_vector_abs(fftR_abs, &fftR_real.vector, &fftR_imag.vector );
+    
+    cout << fftR_abs->data[0] << "\t" << fftR_abs->data[1] << "\t" << fftR_abs->data[2] << "\t" << endl;
+    cout << fftR_abs->size<< "\t" << (&fftR_real.vector)->size << "\t" << (&fftR_imag.vector)->size << "\t" << endl;
+
+
+    //Plotting
+    /*
+    gsl_matrix *plotting = gsl_matrix_calloc(zero_pad_size, 3);
+    gsl_matrix_set_col (plotting, 0, kvar_0pad);
+    gsl_matrix_set_col (plotting, 1, mu_0pad);
+    gsl_matrix_set_col (plotting, 2, mu_widowed);
+    int max_k=search_max(kvar_0pad, 35.);
+    int min_k=search_max(kvar_0pad, 1.0);
+    gsl_matrix_view plotting_lim = gsl_matrix_submatrix (plotting, min_k, 0, max_k-min_k, 3);
+    plot_matplotlib(&plotting_lim.matrix);
+    gsl_matrix_free (plotting);
+    */
+
+    /*
+    gsl_matrix *plotting = gsl_matrix_calloc(zero_pad_size, 2);
+    gsl_matrix_set_col (plotting, 0, r_0pad);
+    gsl_matrix_set_col (plotting, 1, mu_0pad);
+    int max_k=search_max(kvar_0pad, 35.);
+    int min_k=search_max(kvar_0pad, 1.0);
+    gsl_matrix_view plotting_lim = gsl_matrix_submatrix (plotting, min_k, 0, max_k-min_k, 3);
+    plot_matplotlib(&plotting_lim.matrix);
+    gsl_matrix_free (plotting);
+    */
+    
+    //for (int i=0; i< 20; i++)
+    //    cout << (&fftR_real.vector)->data[i]<<endl;
     
 
-    plot_matplotlib(e);
+    gsl_matrix *plotting = gsl_matrix_calloc(r_0pad->size/2, 4);
+    gsl_matrix_set_col (plotting, 0,  r_0pad);
+    gsl_matrix_set_col (plotting, 1,  fftR_abs);
+    gsl_matrix_set_col (plotting, 2,  &fftR_real.vector);
+    gsl_matrix_set_col (plotting, 3,  &fftR_imag.vector);
 
-    double *data = new double [mu_0pad->size] ;
-    memcpy(data, mu_0pad->data, mu_0pad->size*sizeof(double));
 
-    //cout << data[1] <<"\t" << data[2] << endl;
-    //cout << "Copy Done" << endl;
-    gsl_fft_real_radix2_transform(data, 1, zero_pad_size);
+    int max_r=search_max(r_0pad, 10.);
+    int min_r=search_max(r_0pad, 0.);
+    gsl_matrix_view plotting_lim = gsl_matrix_submatrix (plotting, min_r, 0, max_r-min_r, plotting->size2);
+    plot_matplotlib(&plotting_lim.matrix);
+    //plot_matplotlib(plotting);
+
+    gsl_matrix_free (plotting);
+    
+
+
 
     //cout << "Done" << endl;
     //cout << data[1] <<"\t" << data[2] << endl;
     
-
-
-
-
     //for (int i = 0; i < kvar->size; i++)
     //{
     //    cout << gsl_vector_get (kvar, i) <<"\t" << gsl_vector_get (muvar, i) << endl;
     //}
 
-
-
-    try
-    {
-        // randomly pick a set of parameters to use in this example
-        const parameter_vector params = 10*randm(3,1);
-        cout << "params: " << trans(params) << endl;
-
-
-        // Now let's generate a bunch of input/output pairs according to our model.
-        std::vector<std::pair<input_vector, double> > data_samples;
-        input_vector input;
-        for (int i = 0; i < 1000; ++i)
-        {
-            input = 10*randm(2,1);
-            const double output = model(input, params);
-
-            // save the pair
-            data_samples.push_back(make_pair(input, output));
-        }
-
-        // Before we do anything, let's make sure that our derivative function defined above matches
-        // the approximate derivative computed using central differences (via derivative()).  
-        // If this value is big then it means we probably typed the derivative function incorrectly.
-        cout << "derivative error: " << length(residual_derivative(data_samples[0], params) - 
-                                               derivative(residual)(data_samples[0], params) ) << endl;
-
-
-
-
-
-        // Now let's use the solve_least_squares_lm() routine to figure out what the
-        // parameters are based on just the data_samples.
-        parameter_vector x;
-        x = 1;
-
-        cout << "Use Levenberg-Marquardt" << endl;
-        // Use the Levenberg-Marquardt method to determine the parameters which
-        // minimize the sum of all squared residuals.
-        solve_least_squares_lm(objective_delta_stop_strategy(1e-7).be_verbose(), 
-                               residual,
-                               residual_derivative,
-                               data_samples,
-                               x);
-
-        // Now x contains the solution.  If everything worked it will be equal to params.
-        cout << "inferred parameters: "<< trans(x) << endl;
-        cout << "solution error:      "<< length(x - params) << endl;
-        cout << endl;
-
-
-
-
-        x = 1;
-        cout << "Use Levenberg-Marquardt, approximate derivatives" << endl;
-        // If we didn't create the residual_derivative function then we could
-        // have used this method which numerically approximates the derivatives for you.
-        solve_least_squares_lm(objective_delta_stop_strategy(1e-7).be_verbose(), 
-                               residual,
-                               derivative(residual),
-                               data_samples,
-                               x);
-
-        // Now x contains the solution.  If everything worked it will be equal to params.
-        cout << "inferred parameters: "<< trans(x) << endl;
-        cout << "solution error:      "<< length(x - params) << endl;
-        cout << endl;
-
-
-
-
-        x = 1;
-        cout << "Use Levenberg-Marquardt/quasi-newton hybrid" << endl;
-        // This version of the solver uses a method which is appropriate for problems
-        // where the residuals don't go to zero at the solution.  So in these cases
-        // it may provide a better answer.
-        solve_least_squares(objective_delta_stop_strategy(1e-7).be_verbose(), 
-                            residual,
-                            residual_derivative,
-                            data_samples,
-                            x);
-
-        // Now x contains the solution.  If everything worked it will be equal to params.
-        cout << "inferred parameters: "<< trans(x) << endl;
-        cout << "solution error:      "<< length(x - params) << endl;
-
-        //double m1 = integrate_function_adapt_simp(&gg1, 0.0, 1.0, tol);
-
-    }
-    catch (std::exception& e)
-    {
-        cout << e.what() << endl;
-    }
 }
-
-// Example output:
-/*
-params: 8.40188 3.94383 7.83099 
-
-derivative error: 9.78267e-06
-Use Levenberg-Marquardt
-iteration: 0   objective: 2.14455e+10
-iteration: 1   objective: 1.96248e+10
-iteration: 2   objective: 1.39172e+10
-iteration: 3   objective: 1.57036e+09
-iteration: 4   objective: 2.66917e+07
-iteration: 5   objective: 4741.9
-iteration: 6   objective: 0.000238674
-iteration: 7   objective: 7.8815e-19
-iteration: 8   objective: 0
-inferred parameters: 8.40188 3.94383 7.83099 
-
-solution error:      0
-
-Use Levenberg-Marquardt, approximate derivatives
-iteration: 0   objective: 2.14455e+10
-iteration: 1   objective: 1.96248e+10
-iteration: 2   objective: 1.39172e+10
-iteration: 3   objective: 1.57036e+09
-iteration: 4   objective: 2.66917e+07
-iteration: 5   objective: 4741.87
-iteration: 6   objective: 0.000238701
-iteration: 7   objective: 1.0571e-18
-iteration: 8   objective: 4.12469e-22
-inferred parameters: 8.40188 3.94383 7.83099 
-
-solution error:      5.34754e-15
-
-Use Levenberg-Marquardt/quasi-newton hybrid
-iteration: 0   objective: 2.14455e+10
-iteration: 1   objective: 1.96248e+10
-iteration: 2   objective: 1.3917e+10
-iteration: 3   objective: 1.5572e+09
-iteration: 4   objective: 2.74139e+07
-iteration: 5   objective: 5135.98
-iteration: 6   objective: 0.000285539
-iteration: 7   objective: 1.15441e-18
-iteration: 8   objective: 3.38834e-23
-inferred parameters: 8.40188 3.94383 7.83099 
-
-solution error:      1.77636e-15
-*/
