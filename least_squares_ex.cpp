@@ -1,59 +1,120 @@
-// The contents of this file are in the public domain. See LICENSE_FOR_EXAMPLE_PROGRAMS.txt
-/*
-
-    This is an example illustrating the use the general purpose non-linear 
-    least squares optimization routines from the dlib C++ Library.
-
-    This example program will demonstrate how these routines can be used for data fitting.
-    In particular, we will generate a set of data and then use the least squares  
-    routines to infer the parameters of the model which generated the data.
-*/
-
-
-//#include <dlib/matrix.h>
-//#include <dlib/optimization.h>
-//#include <dlib/numeric_constants.h>
-//#include <dlib/numerical_integration.h>
-#include <iostream>
-#include <fstream>
-#include <iomanip>
+//#include <iostream>
+//#include <fstream>
+//#include <iomanip>
 //#include <vector>
+#include <gsl/gsl_errno.h>
 #include <gsl/gsl_randist.h>
 #include <gsl/gsl_cdf.h>
 #include <gsl/gsl_integration.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_fft_real.h>
 #include <gsl/gsl_fft_halfcomplex.h>
-    
+#include <gsl/gsl_spline.h>
+#include <gsl/gsl_multifit_nlin.h>
+
+
+//#include <Eigen/Core>
 #include <python2.7/Python.h>
     
-using namespace std;
-//using namespace dlib;
+//using namespace std;
+jmp_buf jumper;
 
+struct student_params { double mu; double sig; double skew; double nu; double lam; double omega; double delta; };
+struct inter_path  { gsl_interp_accel *acc; gsl_spline *phc_spline; gsl_spline *mag_spline; gsl_spline *pha_spline; gsl_spline *lam_spline;};
+struct fit_params  { double mu; double sig; double skew; double nu; double S02; double kshift; };
+struct mu_data_fit { gsl_vector *k; gsl_vector *mu; };
 
-#define REAL(z,i) ((z)[2*(i)])
-#define IMAG(z,i) ((z)[2*(i)+1])
-
-// ----------------------------------------------------------------------------------------
-
-//typedef matrix<double,2,1> input_vector;
-//typedef matrix<double,3,1> parameter_vector;
-
-// ----------------------------------------------------------------------------------------
-
-// We will use this function to generate data.  It represents a function of 2 variables
-// and 3 parameters.   The least squares procedure will be used to infer the values of 
-// the 3 parameters based on a set of input/output pairs.
+static struct inter_path splines;
+const double N = 4.; //coordination number
 
 double skew_student(double x, double mu, double sig,  double skew, double  nu){
     return 2.*gsl_ran_tdist_pdf((x-mu)/sig, nu)* \
     gsl_cdf_tdist_P(skew*((x-mu)/sig)*sqrt((nu+1.)/(nu+(x-mu)*(x-mu)/sig/sig)),(nu+1.))/sig;
 }
 
-double itegral_student(double x, double mu, double sig,  double skew, double  nu){
+double itegral_student(double x, void * p){
+    //delta=phase_f(k)+phc_f(k); omega= 2.0*k
+    struct student_params * params = (struct student_params *)p;
+    double mu   = (params->mu   );
+    double sig  = (params->sig  );
+    double skew = (params->skew );
+    double nu   = (params->   nu);
+    double lam  = (params->lam);    
+    double delta= (params->delta);
+    double omega= (params->omega);
 
-    return 2.*gsl_ran_tdist_pdf((x-mu)/sig, nu)* \
-    gsl_cdf_tdist_P(skew*((x-mu)/sig)*sqrt((nu+1.)/(nu+(x-mu)*(x-mu)/sig/sig)),(nu+1.))/sig;
+    double t = skew_student(x, mu, sig, skew, nu);
+    //cout << t << "\t" << t/x/x*exp(-2.*x/lam)*sin(omega*x+delta) <<endl;
+    return t/x/x*exp(-2.*x/lam)*sin(omega*x+delta);
+}
+
+
+extern "C" {int compute_itegral(const gsl_vector *k, void * p, gsl_vector *out){
+    //delta=phase_f(k)+phc_f(k); omega= 2.0*k
+    struct fit_params * fp = (struct fit_params *)p;
+    double L=10.0, result, error;
+
+    gsl_function F;
+    struct student_params params;
+    params.mu=fp->mu; params.sig=fp->sig; params.skew=fp->skew; params.nu=fp->nu;
+    F.function = &itegral_student;
+    F.params = &params;
+    if ( params.nu < -1. )
+    {
+        gsl_vector_set_zero(out);
+        return GSL_SUCCESS;
+    } 
+    gsl_integration_workspace * w         = gsl_integration_workspace_alloc (10000);
+    for (int i=1; i< k->size; i++){
+        double kv=gsl_vector_get(k, i);
+        params.delta= gsl_spline_eval(splines.pha_spline, kv, splines.acc) + \
+                       gsl_spline_eval(splines.phc_spline, kv, splines.acc);
+        params.omega=2.*kv;
+        params.lam  = gsl_spline_eval(splines.lam_spline, kv, splines.acc);
+        //cout << i << " " << kv << " "<< params.mu  << " "<< params.sig << " "<< params.skew << " "<< params.nu  << " "<< params.omega << " "<< params.lam <<endl;
+        gsl_integration_qag(&F, 0.1, L, 0., 1e-8, 1000, GSL_INTEG_GAUSS51, w, &result, &error); 
+        //gsl_integration_qawo (&F, 0., 0., 1e-7, 100, w, int_table, &result, &error);
+
+        //amp=N*S02*mag_f(k_var)*np.power(k_f(k_var), kweight-1.0)*tmp
+        result*=N*(fp->S02)*gsl_spline_eval(splines.mag_spline, kv, splines.acc)/kv;
+        //cout << kv << "\t" << result <<endl;
+        gsl_vector_set(out, i, result);  
+    }
+    gsl_integration_workspace_free (w);
+    return GSL_SUCCESS;}
+}
+
+
+extern "C" {
+    int resudial_itegral(const gsl_vector *in, void * p, gsl_vector *out){
+    //delta=phase_f(k)+phc_f(k); omega= 2.0*k
+    struct mu_data_fit * mu = (struct mu_data_fit *)p;
+    struct fit_params fp = {in->data[0], in->data[1], in->data[2], \
+                            in->data[3], in->data[4], in->data[5]} ;
+
+    //cout << "dasdas " << fp.mu  << " "<< fp.sig << " "<< fp.skew << " "<< fp.nu   <<endl;
+    for (int i =0; i< in->size; i++){
+        printf("%14.5f", gsl_vector_get (in, i)) ;
+    }
+    printf("\n") ;
+    //cout << "1213rw " << gsl_vector_get (in, 0)  << endl; // " "<< guess->data[1] << " "<< guess->data[2] << " "<< guess->data[3]   <<endl;
+    //cout << "gggg" << mu->k->data[0] << " "<< mu->k->data[1] << " "<< mu->mu->data[0] << " "<< mu->mu->data[1]   <<endl;
+    
+    gsl_vector_set_zero(out);
+    compute_itegral(mu->k, &fp, out);
+    /*
+    for (int i =0; i< in->size; i++){
+        printf("%10.5f", gsl_vector_get (out, i)) ;
+    }
+    printf("\n") ;*/
+    gsl_vector_set (out, 0, 0.0) ;
+    gsl_vector_sub(out, mu->mu);
+    //for (int i =0; i< in->size; i++){
+    //    printf("%10.5f", gsl_vector_get (out, i)) ;
+    //}
+    //printf("\n") ;
+
+    return GSL_SUCCESS;}
 }
 
 int search_min(const gsl_vector *v, double val){
@@ -69,18 +130,17 @@ int search_max(const gsl_vector *v, double val){
         }
 }
 
-void complex_vector_abs(gsl_vector *out, const gsl_vector *re, const gsl_vector *im )
-{
+void complex_vector_abs(gsl_vector *out, const gsl_vector *re, const gsl_vector *im ){
     for (int i=0; i < out->size; i++ )
         gsl_vector_set(out, i, sqrt( gsl_vector_get(re,i)*gsl_vector_get(re,i) + gsl_vector_get(im,i)*gsl_vector_get(im,i) ) );
 }
 
-gsl_vector * c_imag(gsl_vector_complex &v){
-    gsl_vector_view im = gsl_vector_complex_real(v);
-    gsl_vector_view im_2 = gsl_vector_subvector_with_stride(&im.vector,1, 2,  v->size/2);
-    return   &im_2.vector;     
+void complex_vector_parts(const gsl_vector_complex *in, gsl_vector *re, gsl_vector *im ){
+    for (int i=0; i < in->size; i+=2 ){
+        gsl_vector_set(re, int(i/2), in->data[i]);
+        gsl_vector_set(im, int(i/2), in->data[i+1]);
+    }
 }
-
 
 
 //Destroy original vector arr
@@ -120,9 +180,9 @@ void plot_matplotlib(gsl_matrix *m){
    Py_Initialize();
    PyRun_SimpleString("import pylab");
    PyRun_SimpleString("import numpy as np");
-   ofstream in;
+   FILE *in;
    char buf[100];
-   in.open("tmp.plt");
+   in = fopen("tmp.plt","w");
    
    size_t rows=m->size1;
    size_t cols=m->size2;
@@ -130,9 +190,9 @@ void plot_matplotlib(gsl_matrix *m){
    for (int i=0; i<rows; i++)
     {
         for (int j = 0; j < cols; j++){
-            in << setprecision(8) << gsl_matrix_get(m,i,j) << "\t";
+            fprintf(in, "%10.6f ", gsl_matrix_get(m,i,j));
         }
-        in << endl;
+        fprintf(in, "\n ");
    }
 
    PyRun_SimpleString("data=np.loadtxt('tmp.plt')");
@@ -143,75 +203,16 @@ void plot_matplotlib(gsl_matrix *m){
    PyRun_SimpleString("pylab.legend()");   
    PyRun_SimpleString("pylab.show()");
    Py_Exit(0);
-   in.close();
+   fclose(in);
 }
 
 
-/*double model (
-    const input_vector& input,
-    const parameter_vector& params
-)
-{
-    const double p0 = params(0);
-    const double p1 = params(1);
-    const double p2 = params(2);
-
-    const double i0 = input(0);
-    const double i1 = input(1);
-
-    const double temp = p0*i0 + p1*i1 + p2;
-
-    return temp*temp;
-}*/
-
-// ----------------------------------------------------------------------------------------
-
-// This function is the "residual" for a least squares problem.   It takes an input/output
-// pair and compares it to the output of our model and returns the amount of error.  The idea
-// is to find the set of parameters which makes the residual small on all the data pairs.
-/*
-double residual (
-    const std::pair<input_vector, double>& data,
-    const parameter_vector& params
-)
-{
-    return model(data.first, params) - data.second;
-}
-
-// ----------------------------------------------------------------------------------------
-
-// This function is the derivative of the residual() function with respect to the parameters.
-parameter_vector residual_derivative (
-    const std::pair<input_vector, double>& data,
-    const parameter_vector& params
-)
-{
-    parameter_vector der;
-
-    const double p0 = params(0);
-    const double p1 = params(1);
-    const double p2 = params(2);
-
-    const double i0 = data.first(0);
-    const double i1 = data.first(1);
-
-    const double temp = p0*i0 + p1*i1 + p2;
-
-    der(0) = i0*2*temp;
-    der(1) = i1*2*temp;
-    der(2) = 2*temp;
-
-    return der;
-}
-
-// ----------------------------------------------------------------------------------------
-*/
 int main()
 {
     const int max_mu_size=601;
-    const int zero_pad_size=pow(2,14);
+    const int zero_pad_size=pow(2,15);
     FILE *in;
-    in= fopen("../mean.chi_9nm", "r");
+    in= fopen("../mean.chi", "r");
     gsl_matrix *e = gsl_matrix_alloc(max_mu_size, 4);
     gsl_vector * kvar=gsl_vector_alloc(max_mu_size);
     gsl_vector * muvar=gsl_vector_alloc(max_mu_size);
@@ -221,9 +222,11 @@ int main()
 
     gsl_matrix_fscanf(in, e);
     fclose(in);
+
     gsl_matrix_get_col(kvar,e,0);
     gsl_matrix_get_col(muvar,e,1);
     gsl_vector_set_zero(mu_0pad);
+    gsl_matrix_free(e);
 
 
     double dk=gsl_vector_get (kvar, 1)-gsl_vector_get (kvar, 0);
@@ -253,28 +256,124 @@ int main()
 
 
     //FFT transform
-    double *data = new double [zero_pad_size] ;
+    double *data = (double *) malloc(zero_pad_size*sizeof(double)); 
+    //new double [zero_pad_size] ;
     memcpy(data, mu_widowed->data, zero_pad_size*sizeof(double));
     gsl_fft_real_radix2_transform(data, 1, zero_pad_size);
 
+    //Unpack complex vector
     gsl_vector_complex *fourier_data = gsl_vector_complex_alloc (zero_pad_size);
     gsl_fft_halfcomplex_radix2_unpack(data, fourier_data->data, 1, zero_pad_size);
-   
-    cout << data[0] << "\t" << data[1] << "\t" << data[2] << "\t" << endl;
-    cout << fourier_data->data[0] << "\t" << fourier_data->data[1] << "\t" << fourier_data->data[2] << "\t" << endl;
-
-
-    //gsl_complex_packed_array fftR = fourier_data->data;
- 
-    gsl_vector_view fftR_real = gsl_vector_complex_real(fourier_data);
-    gsl_vector *fftR_imag = c_imag(*fourier_data);
-    gsl_vector *fftR_abs=gsl_vector_alloc(fourier_data->size / 2);
-    complex_vector_abs(fftR_abs, &fftR_real.vector, &fftR_imag.vector );
+    gsl_vector *fftR_real = gsl_vector_alloc(fourier_data->size/2);
+    gsl_vector *fftR_imag = gsl_vector_alloc(fourier_data->size/2);
+    gsl_vector *fftR_abs  = gsl_vector_alloc(fourier_data->size/2);
+    complex_vector_parts(fourier_data, fftR_real, fftR_imag);
+    complex_vector_abs(fftR_abs, fftR_real, fftR_imag);
     
-    cout << fftR_abs->data[0] << "\t" << fftR_abs->data[1] << "\t" << fftR_abs->data[2] << "\t" << endl;
-    cout << fftR_abs->size<< "\t" << (&fftR_real.vector)->size << "\t" << (&fftR_imag.vector)->size << "\t" << endl;
+    gsl_vector *first_shell=gsl_vector_alloc(fftR_abs->size);
+    gsl_vector_memcpy (first_shell, fftR_abs);
+    double rmin=1.0, rmax=2.85, dwr=0.1;
+    hanning(first_shell, r_0pad, rmin, rmax, dwr);
 
 
+    //feff0001.dat
+    const int path_lines=68; 
+    e = gsl_matrix_alloc(path_lines, 7); 
+    gsl_vector * k_p  =gsl_vector_alloc(path_lines);
+    gsl_vector * phc_p=gsl_vector_alloc(path_lines);
+    gsl_vector * mag_p=gsl_vector_alloc(path_lines);
+    gsl_vector * pha_p=gsl_vector_alloc(path_lines);
+    gsl_vector * lam_p=gsl_vector_alloc(path_lines);
+    
+    in= fopen("../FEFF/feff0001.dat", "r");
+    gsl_matrix_fscanf(in, e);
+    fclose(in);
+    
+    gsl_matrix_get_col(k_p  ,e,0);
+    gsl_matrix_get_col(phc_p,e,1);
+    gsl_matrix_get_col(mag_p,e,2);
+    gsl_matrix_get_col(pha_p,e,3);
+    gsl_matrix_get_col(lam_p,e,5);
+    gsl_matrix_free(e);
+
+    gsl_interp_accel *acc = gsl_interp_accel_alloc ();
+    gsl_spline *k_spline   = gsl_spline_alloc (gsl_interp_cspline, path_lines);
+    gsl_spline *phc_spline = gsl_spline_alloc (gsl_interp_cspline, path_lines);
+    gsl_spline *mag_spline = gsl_spline_alloc (gsl_interp_cspline, path_lines);
+    gsl_spline *pha_spline = gsl_spline_alloc (gsl_interp_cspline, path_lines);
+    gsl_spline *lam_spline = gsl_spline_alloc (gsl_interp_cspline, path_lines);
+
+    gsl_spline_init (k_spline  , k_p->data, k_p->data  , path_lines);
+    gsl_spline_init (phc_spline, k_p->data, phc_p->data, path_lines);
+    gsl_spline_init (mag_spline, k_p->data, mag_p->data, path_lines);
+    gsl_spline_init (pha_spline, k_p->data, pha_p->data, path_lines);
+    gsl_spline_init (lam_spline, k_p->data, lam_p->data, path_lines);
+
+
+    gsl_vector * mu_p  =gsl_vector_alloc(path_lines);
+
+    //struct fit_params { student_params t; double kshift; double S02; double N; inter_path splines; };
+    //student_params t   = {2.45681867, 0.02776907, -21.28920008, 9.44741797, 0.0, 0.0, 0.0};
+
+    splines.acc=acc; splines.phc_spline=phc_spline; splines.mag_spline=mag_spline;
+    splines.pha_spline=pha_spline; splines.lam_spline=lam_spline;
+    
+    
+    fit_params fp = { 2.45681867, 0.02776907, -21.28920008, 9.44741797, 1.0, 0.0};
+    compute_itegral(k_p, &fp, mu_p);
+
+    mu_data_fit params = { k_p, mu_p};
+
+    // initialize the solver
+    size_t Nparams=6;
+    gsl_vector *guess0 = gsl_vector_alloc(Nparams);
+
+    gsl_vector_set(guess0, 0, 2.45);
+    gsl_vector_set(guess0, 1, 0.01);
+    gsl_vector_set(guess0, 2, 10.0);
+    gsl_vector_set(guess0, 3,  5.0);
+    gsl_vector_set(guess0, 4,  1.0);
+    gsl_vector_set(guess0, 5,  0.0);
+
+
+    gsl_multifit_function_fdf fit_mu_k;
+    fit_mu_k.f = &resudial_itegral;
+    fit_mu_k.n = path_lines;
+    fit_mu_k.p = Nparams;
+    fit_mu_k.params = &params;
+    fit_mu_k.df = NULL;
+    fit_mu_k.fdf = NULL;
+
+
+
+
+    gsl_multifit_fdfsolver *solver = gsl_multifit_fdfsolver_alloc(gsl_multifit_fdfsolver_lmsder, path_lines, Nparams);
+    gsl_multifit_fdfsolver_set(solver, &fit_mu_k, guess0);
+
+    size_t iter=0, status;
+    do{
+        iter++;
+        //cout << solver->x->data[0] << " " << solver->x->data[1] <<endl;
+        status = gsl_multifit_fdfsolver_iterate (solver);
+        printf("%12.4f %12.4f %12.4f\n", solver->J->data[0,0], solver->J->data[1,1], solver->J->data[2,2] );
+        //gsl_multifit_fdfsolver_dif_df  (k_p, &fit_mu_k, mu_p, solver->J);
+        //gsl_multifit_fdfsolver_dif_fdf (k_p, &fit_mu_k, mu_p, solver->J);
+        printf ("status = %s\n", gsl_strerror (status));
+        //print_state (iter, solver);
+        if (status) break;
+        status = gsl_multifit_test_delta (solver->dx, solver->x, 1e-4, 1e-4);
+    }while (status == GSL_CONTINUE && iter < 500);
+
+
+
+    //cout << gsl_spline_eval (k_spline, 1.333, acc) << endl;
+    //cout << gsl_spline_eval (phc_spline, 1.333, acc) << endl;
+
+
+    //cout << data[0] << "\t" << data[1] << "\t" << data[2] << "\t" << endl;
+    //cout << fourier_data->data[0] << "\t" << fourier_data->data[1] << "\t" << fourier_data->data[2] << "\t" << endl;
+
+   
     //Plotting
     /*
     gsl_matrix *plotting = gsl_matrix_calloc(zero_pad_size, 3);
@@ -298,28 +397,20 @@ int main()
     plot_matplotlib(&plotting_lim.matrix);
     gsl_matrix_free (plotting);
     */
-    
-    //for (int i=0; i< 20; i++)
-    //    cout << (&fftR_real.vector)->data[i]<<endl;
-    
-
-    gsl_matrix *plotting = gsl_matrix_calloc(r_0pad->size/2, 4);
+  
+    gsl_matrix *plotting = gsl_matrix_calloc(r_0pad->size, 5);
     gsl_matrix_set_col (plotting, 0,  r_0pad);
     gsl_matrix_set_col (plotting, 1,  fftR_abs);
-    gsl_matrix_set_col (plotting, 2,  &fftR_real.vector);
-    gsl_matrix_set_col (plotting, 3,  &fftR_imag.vector);
-
-
-    int max_r=search_max(r_0pad, 10.);
+    gsl_matrix_set_col (plotting, 2,  fftR_real);
+    gsl_matrix_set_col (plotting, 3,  fftR_imag);
+    gsl_matrix_set_col (plotting, 4,  first_shell);
+    
     int min_r=search_max(r_0pad, 0.);
+    int max_r=search_max(r_0pad, 5.);
     gsl_matrix_view plotting_lim = gsl_matrix_submatrix (plotting, min_r, 0, max_r-min_r, plotting->size2);
     plot_matplotlib(&plotting_lim.matrix);
     //plot_matplotlib(plotting);
-
     gsl_matrix_free (plotting);
-    
-
-
 
     //cout << "Done" << endl;
     //cout << data[1] <<"\t" << data[2] << endl;
